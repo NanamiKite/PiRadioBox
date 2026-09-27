@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """PiRadioBox: a 480 x 320 internet radio, with a windowed desktop mode."""
 import argparse
+from collections import OrderedDict
 import datetime
 import logging
 from logging.handlers import RotatingFileHandler
 import math
 from pathlib import Path
+import random
 import time
 
 from radio_core import load_config, load_settings, save_settings
@@ -77,6 +79,23 @@ class RadioApp:
         pg.display.set_caption("PiRadioBox")
         font_path = find_font(pg, config["font_path"])
         self.fonts = {size: pg.font.Font(font_path, size) for size in (11, 12, 14, 16, 20, 26, 62)}
+        self.text_cache = OrderedDict()
+        self.night_scene = self.make_night_scene()
+        self.night_panel = pg.Surface((448, 118), pg.SRCALPHA)
+        pg.draw.rect(self.night_panel, (9, 16, 30, 205), self.night_panel.get_rect(), border_radius=18)
+        stars = random.Random(8419)
+        self.night_stars = [(stars.randrange(WIDTH), stars.randrange(18, 198),
+                             stars.choice((1, 1, 1, 2)), stars.random() * math.tau)
+                            for _ in range(50)]
+        slide_dir = Path(config["slideshow_dir"])
+        self.slide_dir = slide_dir if slide_dir.is_absolute() else BASE / slide_dir
+        self.slideshow_interval = config["slideshow_interval"]
+        self.slide_paths = []
+        self.slide_cache = OrderedDict()
+        self.slide_check_at = 0
+        self.slide_started = time.monotonic()
+        self.slide_offset = 0
+        self.refresh_slides(self.slide_started, force=True)
         self.stations = config["stations"]
         self.index = next(i for i, s in enumerate(self.stations) if s["url"] == settings["station_url"])
         self.favorites = set(settings["favorites"])
@@ -111,6 +130,144 @@ class RadioApp:
         self.stats = SystemStats()
         self.snapshot = radio.snapshot()
         self.ensure_visible()
+
+    def make_night_scene(self):
+        """Draw a calm, colorful fallback landscape when no personal photos exist."""
+        pg = self.pg
+        scene = pg.Surface((WIDTH, HEIGHT))
+        top, bottom = (18, 25, 52), (73, 61, 91)
+        for y in range(HEIGHT):
+            ratio = y / HEIGHT
+            color = tuple(int(a + (b - a) * ratio) for a, b in zip(top, bottom))
+            pg.draw.line(scene, color, (0, y), (WIDTH, y))
+        glow = pg.Surface((WIDTH, HEIGHT), pg.SRCALPHA)
+        pg.draw.circle(glow, (203, 190, 155, 20), (365, 85), 48)
+        pg.draw.circle(glow, (218, 205, 171, 32), (365, 85), 35)
+        scene.blit(glow, (0, 0))
+        pg.draw.circle(scene, (237, 225, 189), (365, 85), 20)
+        pg.draw.circle(scene, (37, 43, 73), (376, 76), 18)
+        pg.draw.polygon(scene, (53, 56, 92), [(0, 228), (0, 186), (87, 106),
+                         (151, 174), (228, 120), (331, 220), (410, 144), (480, 196), (480, 250)])
+        pg.draw.polygon(scene, (37, 51, 79), [(0, 239), (113, 166), (196, 232),
+                         (316, 160), (423, 234), (480, 194), (480, 265)])
+        pg.draw.rect(scene, (29, 48, 75), (0, 231, WIDTH, 89))
+        for y in range(241, 318, 10):
+            spread = (y - 235) * 0.8
+            half = int(max(5, spread * 0.72))
+            pg.draw.line(scene, (74, 91, 120), (365 - half, y), (365 + half, y), 2)
+        for x, base, height in ((18, 261, 46), (47, 250, 37), (83, 266, 57),
+                                (408, 248, 36), (439, 263, 51), (468, 250, 44)):
+            pg.draw.polygon(scene, (18, 32, 53), [(x, base - height), (x - 16, base - 5),
+                         (x - 6, base - 8), (x - 19, base + 5), (x + 18, base + 5),
+                         (x + 7, base - 8), (x + 16, base - 5), (x, base - height)])
+        return scene
+
+    def refresh_slides(self, now, force=False):
+        if not force and now < self.slide_check_at:
+            return
+        self.slide_check_at = now + 10
+        try:
+            found = sorted(path for path in self.slide_dir.iterdir()
+                           if path.is_file() and path.suffix.lower() in
+                           (".jpg", ".jpeg", ".png", ".bmp", ".webp"))
+        except OSError:
+            found = []
+        if found != self.slide_paths:
+            self.slide_paths = found
+            self.slide_cache.clear()
+            self.slide_started = now
+            self.slide_offset = 0
+
+    def load_slide(self, index):
+        if not self.slide_paths:
+            return None
+        index %= len(self.slide_paths)
+        if index in self.slide_cache:
+            self.slide_cache.move_to_end(index)
+            return self.slide_cache[index]
+        path = self.slide_paths[index]
+        try:
+            source = self.pg.image.load(str(path))
+            source_width, source_height = source.get_size()
+            if source_width <= 0 or source_height <= 0:
+                raise ValueError("图片尺寸无效")
+            scale = max(WIDTH / source_width, HEIGHT / source_height)
+            size = (round(source_width * scale), round(source_height * scale))
+            photo = self.pg.transform.smoothscale(source, size)
+            self.slide_cache[index] = photo
+            while len(self.slide_cache) > 3:
+                self.slide_cache.popitem(last=False)
+            return photo
+        except Exception:
+            LOG.warning("无法打开幻灯片图片 %s", path, exc_info=True)
+            self.slide_paths.remove(path)
+            self.slide_cache.clear()
+            return None
+
+    def next_slide(self, amount=1):
+        if len(self.slide_paths) > 1:
+            self.slide_offset = (self.slide_offset + amount) % len(self.slide_paths)
+            self.slide_started = time.monotonic()
+
+    def draw_night_background(self, now):
+        pg = self.pg
+        self.refresh_slides(now)
+        if self.slide_paths:
+            elapsed = max(0, now - self.slide_started)
+            count = len(self.slide_paths)
+            position = int(elapsed // self.slideshow_interval) % count
+            if elapsed % self.slideshow_interval >= self.slideshow_interval - 2:
+                self.load_slide((position + 1 + self.slide_offset) % count)
+            previous = (position - 1 + self.slide_offset) % count
+            current = (position + self.slide_offset) % count
+            old_photo, new_photo = self.load_slide(previous), self.load_slide(current)
+            pg.draw.rect(self.screen, BG, (0, 0, WIDTH, HEIGHT))
+            if old_photo is not None:
+                old_photo.set_alpha(255)
+                self.screen.blit(old_photo, old_photo.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+            if new_photo is not None:
+                fade = min(255, round((elapsed % self.slideshow_interval) * 255 / 1.2))
+                new_photo.set_alpha(fade if count > 1 and current != previous else 255)
+                self.screen.blit(new_photo, new_photo.get_rect(center=(WIDTH // 2, HEIGHT // 2)))
+                new_photo.set_alpha(255)
+        else:
+            self.screen.blit(self.night_scene, (0, 0))
+            for x, y, radius, phase in self.night_stars:
+                brightness = 96 + int(60 * (0.5 + 0.5 * math.sin(now * 0.8 + phase)))
+                pg.draw.circle(self.screen, (brightness, brightness, min(255, brightness + 28)),
+                               (x, y), radius)
+
+    def draw_night(self, now, snapshot):
+        pg = self.pg
+        self.draw_night_background(now)
+        self.screen.blit(self.night_panel, (16, 190))
+        self.text("PI RADIO  ·  夜色电台", 26, 16, 12, CYAN)
+        if self.slide_paths:
+            count = len(self.slide_paths)
+            position = (int(max(0, now - self.slide_started) // self.slideshow_interval) +
+                        self.slide_offset) % count + 1
+            self.text(f"{position:02}/{count:02}", 415, 16, 12, WHITE)
+        else:
+            self.text("轻触屏幕返回", 374, 16, 12, WHITE)
+        clock_text = datetime.datetime.now().strftime("%H:%M")
+        width = self.fonts[62].size(clock_text)[0]
+        self.text(clock_text, (WIDTH - width) // 2, 50, 62, WHITE)
+        today = datetime.datetime.now()
+        date = today.strftime("%Y-%m-%d") + "  周" + "一二三四五六日"[today.weekday()]
+        date_width = self.fonts[16].size(date)[0]
+        self.text(date, (WIDTH - date_width) // 2, 126, 16, (234, 231, 225))
+        self.text(self.stations[self.index]["name"], 32, 201, 20, WHITE, 412, scroll=True)
+        track = snapshot.metadata or snapshot.detail
+        self.text(track, 32, 231, 12, (190, 207, 222), 412, scroll=True)
+        self.text(snapshot.detail, 32, 255, 12,
+                  GREEN if snapshot.status == "playing" else WHITE, 310)
+        if snapshot.sleep_remaining:
+            self.text(f"{math.ceil(snapshot.sleep_remaining / 60)} 分钟", 378, 255, 12, ACCENT)
+        if self.slide_paths:
+            self.text("左右键切换 · 轻触返回", 32, 280, 11, (174, 190, 208), 412)
+        else:
+            self.text("将 JPG / PNG 照片放进 slides 文件夹即可轮播", 32, 280, 11,
+                      (174, 190, 208), 412)
 
     def visible_indices(self):
         return [i for i, s in enumerate(self.stations)
@@ -202,6 +359,8 @@ class RadioApp:
             self.notify(f"{self.sleep_choice} 分钟后停止播放" if self.sleep_choice else "已取消睡眠定时")
         elif name == "night":
             self.night = not self.night
+            if self.night:
+                self.slide_started = time.monotonic()
         elif name == "info":
             self.info = not self.info
         elif name == "up":
@@ -260,6 +419,9 @@ class RadioApp:
         if event.type == pg.QUIT:
             self.running = False
         elif event.type == pg.KEYDOWN:
+            if self.night and event.key in (pg.K_LEFT, pg.K_RIGHT):
+                self.next_slide(-1 if event.key == pg.K_LEFT else 1)
+                return
             actions = {pg.K_SPACE: "play", pg.K_LEFT: "prev", pg.K_RIGHT: "next",
                        pg.K_n: "night", pg.K_i: "info", pg.K_s: "sleep", pg.K_f: "favorite"}
             if event.key == pg.K_ESCAPE:
@@ -296,7 +458,15 @@ class RadioApp:
             while text and font.size(text + "…")[0] > width:
                 text = text[:-1]
             text += "…"
-        surface = font.render(text, True, color)
+        key = (size, text, color)
+        surface = self.text_cache.get(key)
+        if surface is None:
+            surface = font.render(text, True, color)
+            self.text_cache[key] = surface
+            if len(self.text_cache) > 512:
+                self.text_cache.popitem(last=False)
+        else:
+            self.text_cache.move_to_end(key)
         old_clip = self.screen.get_clip()
         if width:
             self.screen.set_clip(old_clip.clip(self.pg.Rect(x, y, width, font.get_linesize())))
@@ -324,9 +494,15 @@ class RadioApp:
             for i in range(10):
                 color = GREEN if i < 6 else ACCENT if i < 8 else RED
                 rect = pg.Rect(201 + i * 25, y, 21, 10)
-                pg.draw.rect(self.screen, color if active and value >= i + 1 else (35, 45, 57), rect, border_radius=2)
-                if active and peak > 0 and i == min(9, int(math.ceil(peak)) - 1):
-                    pg.draw.line(self.screen, WHITE, rect.topleft, rect.topright)
+                pg.draw.rect(self.screen, (35, 45, 57), rect, border_radius=2)
+                if active:
+                    fill = max(0, min(21, round((value - i) * 21)))
+                    if fill:
+                        pg.draw.rect(self.screen, color,
+                                     (rect.x, rect.y, fill, rect.height), border_radius=2)
+            if active and peak > 0:
+                peak_x = 201 + round(min(10, peak) * 25)
+                pg.draw.line(self.screen, WHITE, (peak_x, y - 2), (peak_x, y + 12), 2)
         for label, x in (("-60", 201), ("-36", 295), ("-18", 370), ("0", 438)):
             self.text(label, x, 161, 11, MUTED)
         self.text(capture.status, 184, 185, 12, CYAN if capture.updated else MUTED, 278)
@@ -337,12 +513,7 @@ class RadioApp:
         now = datetime.datetime.now()
         snapshot, capture = self.snapshot, self.meter.snapshot()
         if self.night:
-            self.text(now.strftime("%H:%M"), 144, 57, 62, (130, 145, 159))
-            self.text(now.strftime("%m-%d") + "  " + "周" + "一二三四五六日"[now.weekday()], 195, 136, 16, MUTED)
-            self.text(self.stations[self.index]["name"], 40, 178, 20, MUTED, 400)
-            self.text(snapshot.detail, 40, 213, 14, MUTED, 400)
-            remaining = f"剩余 {math.ceil(snapshot.sleep_remaining / 60)} 分钟 · " if snapshot.sleep_remaining else ""
-            self.text(remaining + "轻触屏幕返回", 40, 275, 14, MUTED, 400)
+            self.draw_night(time.monotonic(), snapshot)
             pg.display.flip()
             return
         indices = self.visible_indices()
@@ -418,7 +589,7 @@ class RadioApp:
             self.stats.update(time.monotonic())
             self.persist()
             self.draw()
-            clock.tick(10 if self.night else 30)
+            clock.tick(60)
 
 
 def configure_logging():

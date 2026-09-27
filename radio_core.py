@@ -56,6 +56,11 @@ def load_config(path):
         config.setdefault(name, "")
         if not isinstance(config[name], str):
             raise ValueError(f"{name} 必须是字符串")
+    config.setdefault("slideshow_dir", "slides")
+    if not isinstance(config["slideshow_dir"], str):
+        raise ValueError("slideshow_dir 必须是字符串")
+    config["slideshow_interval"] = integer(config.get("slideshow_interval", 20),
+                                            "slideshow_interval", 5, 3600)
     return config
 
 

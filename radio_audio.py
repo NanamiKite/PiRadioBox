@@ -203,13 +203,14 @@ class AudioMeter:
                 last = time.monotonic()
                 next_device_check = last + 5
                 # Use native channel count; avoids requesting stereo from mono devices.
-                with mic.recorder(samplerate=48000, blocksize=2048) as recorder:
+                # Read half of a small two-block buffer to reduce capture latency.
+                with mic.recorder(samplerate=48000, blocksize=1024) as recorder:
                     while not self.quit.is_set():
                         if not self.device and time.monotonic() >= next_device_check:
                             if choose_monitor(sc).id != mic.id:
                                 break
                             next_device_check = time.monotonic() + 5
-                        data = recorder.record(numframes=1024)
+                        data = recorder.record(numframes=512)
                         now = time.monotonic()
                         dt, last = min(0.25, now - last), now
                         targets = [0.0, 0.0]

@@ -6,6 +6,8 @@
   "max_retries": 3,
   "network_caching_ms": 1500,
   "vu_enabled": true,
+  "slideshow_dir": "slides",
+  "slideshow_interval": 20,
   "monitor_device": "",
   "font_path": "",
   "stations": [
