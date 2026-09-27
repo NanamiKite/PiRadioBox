@@ -1,0 +1,5 @@
+pygame>=2.5,<3
+python-vlc>=3.0,<4
+psutil>=5.9,<8
+numpy>=1.24,<3
+soundcard>=0.4,<1

@@ -1,114 +1,131 @@
 # PiRadioBox
 
-一个运行在树莓派上的简单网络电台播放器，针对 480×320 的 3.5 英寸 LCD 屏幕设计。
-
-使用 Python 编写，界面基于 Pygame，音频播放使用 VLC。除了基本的电台播放和音量控制外，还加入了实时双声道 VU 电平、播放信息以及树莓派系统状态显示。
+运行在树莓派上的网络收音机，适配 480×320 的 3.5 英寸触摸屏，也支持桌面窗口调试。Python + Pygame 绘制界面，VLC 播放网络电台。
 
 ## 功能
 
-* 网络电台播放
-* 电台切换
-* 播放 / 暂停
-* 音量调节
-* L/R 双声道实时 VU 电平
-* 获取电台 Now Playing / Title 信息
-* CPU 使用率和温度显示
-* RAM 使用率显示
-* 网络下载速度显示
-* 480×320 全屏界面
-* 支持触摸、鼠标和键盘操作
+- 实际播放状态：连接、缓冲、直播、暂停、重试、失败。
+- 连接/缓冲超时、播放进度停滞检测；默认最多重试 3 次，依次等待 2、4、8 秒，稳定播放 30 秒后恢复重试额度。
+- 收藏与筛选、可滚动电台列表、长标题滚动、音量拖动。
+- 自动记住电台、音量和收藏；按 URL 识别电台，调整列表顺序不会串台。
+- 输出回环 L/R 电平：-60～0 dBFS、快速上升/缓慢回落、峰值保持；采集失败不影响播放。
+- 15 / 30 / 60 / 90 分钟睡眠定时，切台不重置定时，到期停止播放并取消重连。
+- 夜间大时钟；单独的系统状态页，显示 CPU、内存、温度、整机下载速度和采集设备。
+- 播放与采集独立后台线程，系统数据每秒更新，普通界面 30 FPS、夜间 10 FPS。
 
-## 安装
+## 安装与运行
 
-首先安装 VLC 和中文字体：
+**Windows：**安装 Python 3.10+ 和 VLC 后，双击项目目录中的 `start.bat`。第一次启动会在项目内创建独立环境并安装 Python 依赖；之后直接打开收音机。VLC 需要与 Python 位数一致。
+
+**树莓派 / Linux 桌面：**先安装 VLC、中文字体和 Python 虚拟环境组件，再运行项目中的 `start.sh`。第一次运行会创建 `.venv` 并安装依赖。
 
 ```bash
 sudo apt update
-sudo apt install vlc fonts-wqy-microhei
+sudo apt install vlc fonts-wqy-microhei python3-venv python3-full
+chmod +x start.sh
+./start.sh
 ```
 
-然后安装 Python 依赖：
+之后开机登录图形桌面时自动启动，可将 `start.sh` 添加到桌面环境的“启动应用程序 / 自启动”列表。
+
+建议 Python 3.10+。树莓派需要可工作的图形显示环境、VLC 和中文字体：
+
+也可手动安装 Python 包：`python -m pip install -r requirements.txt`。
+
+默认全屏、自动播放上次电台；首次使用音量为 40%。电台服务和网络可用性会变化，项目保留原有七个预设，未保证所有地址始终有效。
+
+Windows 上先安装与 Python 位数一致的 VLC，使用系统微软雅黑字体。桌面调试：
 
 ```bash
-pip3 install pygame python-vlc psutil numpy soundcard
+python main.py --windowed
+python main.py --windowed --no-vu
 ```
 
-如果使用虚拟环境：
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install pygame python-vlc psutil numpy soundcard
-```
-
-## 运行
-
-```bash
-python3 main.py
-```
-
-启动后程序会直接进入全屏模式，并自动播放第一台电台。
+`--no-vu` 跳过采集和 NumPy/SoundCard 导入；没有回环设备也能正常听电台。程序只初始化 Pygame 的显示与字体，不额外占用音频输出。
 
 ## 操作
 
-触摸或鼠标：
+| 操作 | 功能 |
+| --- | --- |
+| 点选电台 | 切台；再次点击当前电台可重新连接 |
+| 上下拖动列表、滚轮、上页/下页 | 浏览更多电台 |
+| 电台名右侧 `*` / `F` | 收藏或取消收藏当前电台 |
+| 左上角“全部电台 / 收藏” | 切换筛选；上一台/下一台遵循当前筛选 |
+| 拖动音量 / `↑` `↓` / `+` `-` | 调整音量，键盘每次 5% |
+| 播放按钮 / `Space` | 播放或暂停 |
+| 上一台/下一台 / `←` `→` | 切换电台 |
+| 定时 / `S` | 循环选择 15、30、60、90 分钟、关闭 |
+| 夜间 / `N` | 切换夜间时钟；轻触屏幕可返回 |
+| 状态 / `I` | 系统状态页 |
+| 退出 / `Esc` | 退出；夜间模式中第一次 Esc 返回主界面 |
 
-* 点击左侧电台切换电台
-* 点击 `|<` 播放上一台
-* 点击 `PLAY / PAUSE` 播放或暂停
-* 点击 `>|` 播放下一台
-* 拖动音量条调节音量
-* 点击右上角 `X` 退出
+这是直播收音机：“暂停”会关闭流连接，再次播放重新接入直播，不保留暂停期间的节目。睡眠定时只停止播放，不关闭树莓派。夜间模式改变画面和刷新率，不控制硬件背光。
 
-键盘：
+## 配置
 
-* `Space`：播放 / 暂停
-* `Esc`：退出
+编辑项目目录下的 `config.json`，重启生效：
 
-## 修改电台
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `stations` | 七个预设 | 非空列表，每项包含 `name`、唯一的 HTTP(S) `url` |
+| `autoplay` | `true` | 启动时自动播放上次电台 |
+| `fullscreen` | `true` | 全屏；`--windowed` 可临时覆盖 |
+| `volume` | `40` | 0～100，首次运行或没有有效保存音量时使用 |
+| `connect_timeout` | `20` | 连接、缓冲或可用播放进度停滞的超时秒数，5～120 |
+| `max_retries` | `3` | 一轮自动重试上限，0～10；耗尽后手动点播放重试 |
+| `network_caching_ms` | `1500` | VLC 网络缓冲，100～10000 毫秒 |
+| `vu_enabled` | `true` | 是否启用输出电平采集 |
+| `monitor_device` | `""` | 自动匹配默认输出回环；也可填回环设备的完整 ID 或名称 |
+| `font_path` | `""` | 自动寻找中文字体；也可填字体文件绝对路径 |
 
-电台列表直接写在 `radio.py` 的 `STATIONS` 中：
+例如增添电台：
 
-```python
-STATIONS = [
-    {"name": "我的电台", "url": "https://example.com/stream"},
-    {"name": "另一个电台", "url": "https://example.com/live"},
-]
+```json
+{"name": "我的电台", "url": "https://example.com/live"}
 ```
 
-只需要修改名称和流媒体地址即可。
+`state.json` 保存电台、音量、收藏，优先于配置中的初始音量。更改后延迟约 0.8 秒合并写入，退出时立即保存，使用临时文件替换避免截断原状态。删除这个文件可恢复默认设置。睡眠定时不跨重启保存。
 
-默认音量也可以修改：
-
-```python
-current_volume = 70
+```bash
+python main.py --check-config
+python main.py --config /path/to/config.json --state /path/to/state.json
 ```
 
-屏幕分辨率默认设置为：
+默认配置、状态和日志路径均相对于项目目录，与终端当前目录无关；显式传入的相对路径则相对于当前工作目录。
 
-```python
-WIDTH, HEIGHT = 480, 320
+## 音频电平与排错
+
+采集只选择输出的 Loopback/Monitor，**不会自动改录物理麦克风**。自动选择先匹配默认输出 ID，再匹配名称；匹配不唯一时显示“电平不可用”。设备出错后每 10 秒重试，自动模式每 5 秒检查默认输出是否改变。
+
+```bash
+python main.py --list-audio-devices
 ```
 
-如果修改分辨率，还需要相应调整界面中的坐标。
+把标为 `MONITOR` 的完整 ID 或名称填入 `monitor_device` 可指定设备。Linux 需要可用的 PulseAudio 服务或 PipeWire 的 PulseAudio 兼容服务；只有 ALSA、没有可访问回环的系统可先用 `--no-vu`。不要仅为了电平随意替换已有音频服务。[SoundCard 官方说明](https://soundcard.readthedocs.io/en/latest/)介绍了后端和设备接口。
 
-## VU 电平
+电平反映所选输出设备的混音，也可能包括其他程序的声音；应让 VLC 输出与所选设备一致。它是数字 RMS/dBFS 指示，不是经过校准的声压计。没有可靠播放时间的流仅使用 VLC 状态和连接/缓冲超时，不依赖音量为零判断断流，以免误判安静节目。
 
-VU 电平通过 SoundCard 获取 PCM 音频数据，然后分别计算左右声道 RMS，用于显示当前实际音频电平。
+程序日志在 `piradiobox.log`，最大约 512 KB，保留两份轮转备份。常见问题：
 
-音频采集运行在独立线程中，不会阻塞 Pygame 主循环。
+- **连接失败**：检查网络及电台 URL；重试用完后可换台或点播放。
+- **VLC 不可用**：确认既安装了 `python-vlc`，也安装了 VLC 本体，且位数一致。
+- **电平不动**：查看状态页设备、运行设备列表命令；没有回环时先禁用 VU。
+- **字体缺失**：安装文泉驿微米黑或设置 `font_path`。
+- **温度不可用**：目标系统未提供树莓派温度文件，不显示虚假的 0°C。
+- **设置未保存**：检查 `--state` 指定目录的写入权限。
 
-播放器输出和音频采集是两个独立部分。系统需要提供可访问的录音或 Loopback/Monitor 设备，VU 电平才能正常获取正在播放的音频。
+## 代码结构与检查
 
-## 依赖
+- `main.py`：界面、触摸/键盘交互、配置入口、系统数据。
+- `radio_core.py`：配置验证、状态持久化、播放状态机、重连和睡眠策略。
+- `radio_audio.py`：VLC 后台任务、输出回环选择与电平采集。
 
-* Python 3
-* Pygame
-* python-vlc
-* VLC
-* NumPy
-* SoundCard
-* psutil
+```bash
+python main.py --check-config
+python -m compileall -q main.py radio_core.py radio_audio.py
+```
+
+配置检查不需要图形或音频依赖。发布到树莓派前应实际检查断网恢复、切台、音量、触摸、睡眠停止和回环设备。
 
 ## License
 

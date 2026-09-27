@@ -1,430 +1,490 @@
 # -*- coding: utf-8 -*-
-import pygame
-import sys
-import vlc
-import time
+"""PiRadioBox: a 480 x 320 internet radio, with a windowed desktop mode."""
+import argparse
 import datetime
-import psutil
-import threading
-import numpy as np
-import soundcard as sc
+import logging
+from logging.handlers import RotatingFileHandler
+import math
+from pathlib import Path
+import time
 
-# --- 1. 电台预设列表 ---
-STATIONS = [
-    {"name": "Lofi Chill 音乐", "url": "https://stream.zeno.fm/f3wvbbqmdg8uv"},
-    {"name": "爵士放松电台",     "url": "https://stream.zeno.fm/0r0xa792kwzuv"},
-    {"name": "Classic FM 古典", "url": "http://media-ice.musicradio.com/ClassicFMMP3"},
-    {"name": "80-90年代经典老歌", "url": "http://stream.zeno.fm/u2e6z6d52zzuv"},
-    {"name": "CNR 中国之声",   "url": "http://ngcdn001.cnr.cn/live/zgzs/index.m3u8"},
-    {"name": "CNR 音乐之声",   "url": "http://ngcdn003.cnr.cn/live/yyzs/index.m3u8"},
-    {"name": "CRI 轻松调频 EZFM","url": "http://live.hitfm.cn/ezfm.m3u8"}
-]
+from radio_core import load_config, load_settings, save_settings
 
-current_index = 0
-is_playing = False
-current_volume = 70       # 初始音量 70%
-is_dragging_vol = False   # 音量拖拽标记
-current_metadata = "正在读取信息..."
-
-# --- 2. 真实音频响度采集全局变量 ---
-real_vu_left = 0.0   # 0.0 ~ 10.0
-real_vu_right = 0.0  # 0.0 ~ 10.0
-audio_thread_running = True
-
-def audio_capture_worker():
-    """后台采集真实音频输出 PCM 并计算 L/R 声道 RMS 响度"""
-    global real_vu_left, real_vu_right
-    
-    try:
-        # 获取默认录音/监控设备
-        mic = sc.default_microphone()
-    except Exception as e:
-        print(f"[Warning] 无法获取音频采集设备，尝试搜索 monitor 设备: {e}")
-        try:
-            mics = sc.all_microphones(include_loopback=True)
-            if len(mics) > 0:
-                mic = mics[0]
-            else:
-                return
-        except Exception:
-            return
-
-    # 采样率 44100, 每次抓取 1024 帧（约 23ms 数据包）
-    sample_rate = 44100
-    block_size = 512
-
-    with mic.recorder(samplerate=sample_rate, channels=2) as recorder:
-        while audio_thread_running:
-            try:
-                data = recorder.record(numframes=block_size)
-                if not is_playing or data is None or len(data) == 0:
-                    real_vu_left = max(0.0, real_vu_left - 1.0)
-                    real_vu_right = max(0.0, real_vu_right - 1.0)
-                    time.sleep(0.03)
-                    continue
-
-                # 分离左 (L) 和右 (R) 声道 PCM 数据
-                l_channel = data[:, 0]
-                r_channel = data[:, 1] if data.shape[1] > 1 else l_channel
-
-                # 计算 RMS (Root Mean Square 均方根振幅)
-                rms_l = np.sqrt(np.mean(l_channel**2))
-                rms_r = np.sqrt(np.mean(r_channel**2))
-
-                # 映射到 0~10 的电平高度 (结合对数增益)
-                val_l = min(10.0, (rms_l * 18.0) ** 0.6 * 10.0)
-                val_r = min(10.0, (rms_r * 18.0) ** 0.6 * 10.0)
-
-                # 平滑滤波 (保留小动感)
-                real_vu_left = real_vu_left * 0.4 + val_l * 0.6
-                real_vu_right = real_vu_right * 0.4 + val_r * 0.6
-
-            except Exception:
-                time.sleep(0.05)
-
-# 启动音频监听后台线程
-cap_thread = threading.Thread(target=audio_capture_worker, daemon=True)
-cap_thread.start()
-
-# --- 3. 硬件数据获取 ---
-last_net_bytes = psutil.net_io_counters().bytes_recv
-last_net_time = time.time()
-current_down_speed = 0.0
-
-def get_cpu_temp():
-    try:
-        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-            return float(f.read()) / 1000.0
-    except Exception:
-        return 0.0
-
-def update_system_stats():
-    global last_net_bytes, last_net_time, current_down_speed
-    cpu_use = psutil.cpu_percent()
-    ram_use = psutil.virtual_memory().percent
-    
-    now_time = time.time()
-    dt = now_time - last_net_time
-    if dt >= 0.5:
-        now_bytes = psutil.net_io_counters().bytes_recv
-        current_down_speed = (now_bytes - last_net_bytes) / dt / 1024.0
-        last_net_bytes = now_bytes
-        last_net_time = now_time
-
-    return cpu_use, ram_use, get_cpu_temp()
-
-# --- 4. VLC 初始化 ---
-vlc_instance = vlc.Instance('--no-video', '--quiet')
-player = vlc_instance.media_player_new()
-player.audio_set_volume(current_volume)
-
-def fetch_metadata():
-    global current_metadata
-    if not is_playing:
-        current_metadata = "播放已暂停"
-        return
-        
-    media = player.get_media()
-    if media:
-        meta = media.get_meta(vlc.Meta.NowPlaying) or media.get_meta(vlc.Meta.Title)
-        if meta and meta.strip():
-            current_metadata = meta
-        else:
-            current_metadata = "实时广播直播中"
-
-def play_station(index):
-    global is_playing, current_metadata
-    station = STATIONS[index]
-    current_metadata = "正在连接..."
-    media = vlc_instance.media_new(station["url"])
-    player.set_media(media)
-    player.play()
-    is_playing = True
-
-def toggle_play():
-    global is_playing
-    if is_playing:
-        player.pause()
-        is_playing = False
-    else:
-        player.play()
-        is_playing = True
-
-def set_volume(val):
-    global current_volume
-    current_volume = max(0, min(100, int(val)))
-    player.audio_set_volume(current_volume)
-
-def exit_app():
-    global audio_thread_running
-    audio_thread_running = False
-    player.stop()
-    pygame.quit()
-    sys.exit()
-
-# --- 5. Pygame 初始化 ---
-pygame.init()
+BASE = Path(__file__).resolve().parent
+LOG = logging.getLogger(__name__)
 WIDTH, HEIGHT = 480, 320
-screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN | pygame.NOFRAME)
-pygame.display.set_caption("树莓派电台 真实 VU 响度版")
+BG = (14, 18, 26)
+CARD = (25, 33, 46)
+ACTIVE = (40, 52, 68)
+WHITE = (235, 241, 247)
+MUTED = (139, 156, 175)
+ACCENT = (255, 143, 96)
+CYAN = (90, 213, 220)
+GREEN = (93, 213, 143)
+RED = (244, 102, 102)
 
-BG_COLOR     = (15, 18, 25)
-CARD_BG      = (26, 32, 44)
-CARD_ACTIVE  = (38, 48, 68)
-TEXT_COLOR   = (240, 245, 250)
-MUTED_TEXT   = (110, 120, 135)
-ACCENT_COLOR = (255, 110, 70)
-GREEN_COLOR  = (60, 200, 120)
-CYAN_COLOR   = (70, 210, 230)
-YELLOW_COLOR = (250, 210, 90)
-BTN_COLOR    = (40, 50, 68)
-RED_COLOR    = (220, 60, 60)
 
-# --- 6. 字体 ---
-font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
-try:
-    font_clock  = pygame.font.Font(font_path, 30)
-    font_large  = pygame.font.Font(font_path, 22)
-    font_medium = pygame.font.Font(font_path, 16)
-    font_small  = pygame.font.Font(font_path, 13)
-    font_tiny   = pygame.font.Font(font_path, 11)
-except IOError:
-    print("未检测到中文字体，请运行: sudo apt install fonts-wqy-microhei")
-    sys.exit()
+class SystemStats:
+    def __init__(self):
+        import psutil
+        self.psutil = psutil
+        self.updated = -math.inf
+        self.previous_bytes = None
+        self.cpu = self.ram = self.speed = 0
+        self.temp = None
 
-# --- 7. 热区定义 ---
-station_rects = []
-for i in range(len(STATIONS)):
-    station_rects.append(pygame.Rect(8, 8 + i * 43, 175, 38))
+    def update(self, now):
+        if now - self.updated < 1:
+            return
+        try:
+            self.cpu = self.psutil.cpu_percent()
+            self.ram = self.psutil.virtual_memory().percent
+            counters = self.psutil.net_io_counters()
+            if counters is not None:
+                if self.previous_bytes is not None:
+                    self.speed = max(0, counters.bytes_recv - self.previous_bytes) / (now - self.updated) / 1024
+                self.previous_bytes = counters.bytes_recv
+        except Exception:
+            LOG.debug("读取系统状态失败", exc_info=True)
+        self.updated = now
+        try:
+            self.temp = float(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000
+        except (OSError, ValueError):
+            self.temp = None
 
-btn_prev = pygame.Rect(192, 255, 85, 57)
-btn_play = pygame.Rect(285, 255, 98, 57)
-btn_next = pygame.Rect(390, 255, 82, 57)
 
-# 退出按钮热区（位于网速/日期显示右侧）
-btn_exit = pygame.Rect(440, 12, 26, 28)
+def find_font(pg, configured):
+    candidates = [configured, "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                  "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+                  "/System/Library/Fonts/PingFang.ttc"]
+    for path in candidates:
+        if path and Path(path).is_file():
+            return path
+    for name in ("notosanscjk", "wenquanyimicrohei", "microsoftyahei", "simhei"):
+        path = pg.font.match_font(name)
+        if path:
+            return path
+    raise RuntimeError("缺少中文字体：安装 fonts-wqy-microhei，或在 config.json 设置 font_path")
 
-# 音量滑块热区及槽位定义
-vol_x, vol_y, vol_w, vol_h = 202, 108, 260, 20
-vol_rect = pygame.Rect(vol_x, vol_y, vol_w, vol_h)
 
-# --- 8. UI 渲染逻辑 ---
-def draw_ui(cpu_use, ram_use, cpu_temp):
-    screen.fill(BG_COLOR)
+class RadioApp:
+    def __init__(self, pg, config, settings, state_path, radio, meter):
+        self.pg, self.config, self.settings = pg, config, settings
+        self.state_path, self.radio, self.meter = state_path, radio, meter
+        flags = pg.FULLSCREEN | pg.NOFRAME if config["fullscreen"] else 0
+        self.screen = pg.display.set_mode((WIDTH, HEIGHT), flags)
+        pg.display.set_caption("PiRadioBox")
+        font_path = find_font(pg, config["font_path"])
+        self.fonts = {size: pg.font.Font(font_path, size) for size in (11, 12, 14, 16, 20, 26, 62)}
+        self.stations = config["stations"]
+        self.index = next(i for i, s in enumerate(self.stations) if s["url"] == settings["station_url"])
+        self.favorites = set(settings["favorites"])
+        self.only_favorites = False
+        self.offset = 0.0
+        self.list_rect = pg.Rect(8, 45, 154, 228)
+        self.vol_rect = pg.Rect(181, 215, 285, 42)
+        self.buttons = {
+            "filter": pg.Rect(8, 8, 154, 30),
+            "sleep": pg.Rect(250, 8, 68, 30),
+            "night": pg.Rect(324, 8, 42, 30),
+            "info": pg.Rect(372, 8, 42, 30),
+            "exit": pg.Rect(420, 8, 52, 30),
+            "favorite": pg.Rect(436, 45, 36, 36),
+            "up": pg.Rect(8, 280, 73, 32),
+            "down": pg.Rect(89, 280, 73, 32),
+            "prev": pg.Rect(174, 264, 82, 48),
+            "play": pg.Rect(263, 264, 121, 48),
+            "next": pg.Rect(391, 264, 81, 48),
+        }
+        self.running = True
+        self.night = self.info = False
+        self.drag = None
+        self.press = None
+        self.scroll_start = 0
+        self.moved = False
+        self.dirty_at = None
+        self.save_failed = False
+        self.toast, self.toast_until = "", 0
+        self.sleep_choice = 0
+        self.sleep_requested_at = 0
+        self.stats = SystemStats()
+        self.snapshot = radio.snapshot()
+        self.ensure_visible()
 
-    # A. 左侧：电台列表
-    for i, station in enumerate(STATIONS):
-        rect = station_rects[i]
-        is_selected = (i == current_index)
-        bg = CARD_ACTIVE if is_selected else CARD_BG
-        pygame.draw.rect(screen, bg, rect, border_radius=6)
-        
-        if is_selected:
-            pygame.draw.rect(screen, ACCENT_COLOR, (rect.x, rect.y + 6, 4, rect.height - 12), border_radius=2)
+    def visible_indices(self):
+        return [i for i, s in enumerate(self.stations)
+                if not self.only_favorites or s["url"] in self.favorites]
 
-        color = ACCENT_COLOR if is_selected else TEXT_COLOR
-        name_str = station["name"]
-        if len(name_str) > 8:
-            name_str = name_str[:7] + ".."
-        txt = font_medium.render(name_str, True, color)
-        screen.blit(txt, (rect.x + 10, rect.y + 9))
+    def clamp_scroll(self):
+        limit = max(0, len(self.visible_indices()) * 38 - self.list_rect.height)
+        self.offset = max(0, min(limit, self.offset))
 
-    # B. 右侧面板背景
-    pygame.draw.rect(screen, CARD_BG, (192, 8, 280, 240), border_radius=10)
+    def ensure_visible(self):
+        indices = self.visible_indices()
+        if self.index in indices:
+            y = indices.index(self.index) * 38
+            if y < self.offset:
+                self.offset = y
+            elif y + 38 > self.offset + self.list_rect.height:
+                self.offset = y + 38 - self.list_rect.height
+        self.clamp_scroll()
 
-    # 时间与网速
-    now = datetime.datetime.now()
-    time_str = now.strftime("%H:%M:%S")
-    time_txt = font_clock.render(time_str, True, TEXT_COLOR)
-    screen.blit(time_txt, (202, 12))
+    def dirty(self):
+        self.dirty_at = time.monotonic()
 
-    net_str = f"| {current_down_speed:.1f} KB/s"
-    net_txt = font_small.render(net_str, True, CYAN_COLOR)
-    screen.blit(net_txt, (355, 15))
+    def notify(self, message):
+        self.toast, self.toast_until = message, time.monotonic() + 3
 
-    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    date_str = f"{now.strftime('%m-%d')} {weekdays[now.weekday()]}"
-    date_txt = font_tiny.render(date_str, True, MUTED_TEXT)
-    screen.blit(date_txt, (355, 32))
+    def persist(self, force=False):
+        if self.dirty_at is None or (not force and time.monotonic() - self.dirty_at < 0.8):
+            return
+        self.settings["favorites"] = [s["url"] for s in self.stations if s["url"] in self.favorites]
+        try:
+            save_settings(self.state_path, self.settings)
+            self.dirty_at = None
+            self.save_failed = False
+        except OSError:
+            if not self.save_failed:
+                LOG.exception("保存设置失败")
+                self.notify("设置保存失败 · 检查目录权限")
+            self.save_failed = True
+            self.dirty_at = time.monotonic() + 9
 
-    # 退出按钮 [X]
-    pygame.draw.rect(screen, RED_COLOR, btn_exit, border_radius=4)
-    exit_txt = font_small.render("X", True, TEXT_COLOR)
-    screen.blit(exit_txt, (btn_exit.x + 8, btn_exit.y + 6))
+    def select(self, index):
+        self.index = index
+        self.settings["station_url"] = self.stations[index]["url"]
+        self.radio.send("select", self.settings["station_url"])
+        self.ensure_visible()
+        self.dirty()
 
-    pygame.draw.line(screen, (45, 55, 75), (202, 48), (462, 48), 1)
+    def step(self, amount):
+        indices = self.visible_indices()
+        if indices:
+            position = indices.index(self.index) if self.index in indices else (-1 if amount > 0 else 0)
+            self.select(indices[(position + amount) % len(indices)])
 
-    # C. 真实音频 10 段双声道 VU 电平指示灯
-    vu_start_x = 202
-    vu_start_y = 54
-    led_width = 21
-    led_height = 8
-    gap = 4
+    def volume(self, value):
+        value = max(0, min(100, int(value)))
+        if value != self.settings["volume"]:
+            self.settings["volume"] = value
+            self.radio.send("volume", value)
+            self.dirty()
 
-    screen.blit(font_tiny.render("L", True, MUTED_TEXT), (vu_start_x, vu_start_y))
-    screen.blit(font_tiny.render("R", True, MUTED_TEXT), (vu_start_x, vu_start_y + 12))
+    def drag_volume(self, x):
+        self.volume((x - 188) / 270 * 100)
 
-    # 10 段指示灯
-    for segment in range(10):
-        if segment < 6:
-            active_color = (60, 210, 100)
-            off_color = (20, 45, 25)
-        elif segment < 8:
-            active_color = (250, 200, 50)
-            off_color = (50, 45, 18)
-        else:
-            active_color = (255, 70, 70)
-            off_color = (50, 20, 20)
+    def action(self, name):
+        if name == "exit":
+            self.running = False
+        elif name == "filter":
+            self.only_favorites = not self.only_favorites
+            self.offset = 0
+            self.ensure_visible()
+        elif name == "favorite":
+            url = self.stations[self.index]["url"]
+            if url in self.favorites:
+                self.favorites.remove(url)
+                self.notify("已取消收藏")
+            else:
+                self.favorites.add(url)
+                self.notify("已收藏当前电台")
+            self.clamp_scroll()
+            self.dirty()
+        elif name == "sleep":
+            choices = (0, 15, 30, 60, 90)
+            now = time.monotonic()
+            if self.sleep_choice and now >= self.sleep_requested_at + self.sleep_choice * 60:
+                self.sleep_choice = 0
+            self.sleep_choice = choices[(choices.index(self.sleep_choice) + 1) % len(choices)]
+            self.sleep_requested_at = now
+            self.radio.send("sleep", self.sleep_choice)
+            self.notify(f"{self.sleep_choice} 分钟后停止播放" if self.sleep_choice else "已取消睡眠定时")
+        elif name == "night":
+            self.night = not self.night
+        elif name == "info":
+            self.info = not self.info
+        elif name == "up":
+            self.offset -= 6 * 38
+            self.clamp_scroll()
+        elif name == "down":
+            self.offset += 6 * 38
+            self.clamp_scroll()
+        elif name == "prev":
+            self.step(-1)
+        elif name == "next":
+            self.step(1)
+        elif name == "play":
+            self.radio.send("toggle")
 
-        l_x = vu_start_x + 16 + segment * (led_width + gap)
-
-        # L 声道灯
-        if segment < int(real_vu_left):
-            pygame.draw.rect(screen, active_color, (l_x, vu_start_y + 2, led_width, led_height), border_radius=2)
-        else:
-            pygame.draw.rect(screen, off_color, (l_x, vu_start_y + 2, led_width, led_height), border_radius=2)
-
-        # R 声道灯
-        if segment < int(real_vu_right):
-            pygame.draw.rect(screen, active_color, (l_x, vu_start_y + 14, led_width, led_height), border_radius=2)
-        else:
-            pygame.draw.rect(screen, off_color, (l_x, vu_start_y + 14, led_width, led_height), border_radius=2)
-
-    pygame.draw.line(screen, (45, 55, 75), (202, 82), (462, 82), 1)
-
-    # D. 硬件 CPU 监控 + 横向音量滑动条
-    sys_info_str = f"CPU: {cpu_use:.0f}% ({cpu_temp:.1f}C)   RAM: {ram_use:.0f}%"
-    sys_txt = font_tiny.render(sys_info_str, True, TEXT_COLOR)
-    screen.blit(sys_txt, (202, 88))
-
-    vol_text = font_tiny.render(f"VOL {current_volume}%", True, CYAN_COLOR)
-    screen.blit(vol_text, (410, 88))
-
-    # 音量条槽位
-    pygame.draw.rect(screen, (18, 22, 32), (vol_x, vol_y, vol_w, vol_h), border_radius=10)
-    
-    # 填充已调高音量的进度部分
-    fill_w = int((current_volume / 100.0) * vol_w)
-    if fill_w > 0:
-        pygame.draw.rect(screen, CYAN_COLOR, (vol_x, vol_y, fill_w, vol_h), border_radius=10)
-
-    # 移动滑块圆点
-    knob_x = vol_x + fill_w
-    knob_x = max(vol_x + 8, min(vol_x + vol_w - 8, knob_x))
-    pygame.draw.circle(screen, TEXT_COLOR, (knob_x, vol_y + vol_h // 2), 7)
-
-    pygame.draw.line(screen, (45, 55, 75), (202, 138), (462, 138), 1)
-
-    # E. 电台名与歌词元数据
-    curr_name = STATIONS[current_index]["name"]
-    curr_txt = font_medium.render(f"> {curr_name}", True, ACCENT_COLOR)
-    screen.blit(curr_txt, (202, 144))
-
-    meta_p1 = current_metadata
-    if len(meta_p1) > 22:
-        meta_p1 = meta_p1[:21] + ".."
-    meta_txt1 = font_small.render(f"TRACK: {meta_p1}", True, YELLOW_COLOR)
-    screen.blit(meta_txt1, (202, 168))
-
-    if len(current_metadata) > 22:
-        meta_p2 = current_metadata[21:]
-        if len(meta_p2) > 24:
-            meta_p2 = meta_p2[:22] + ".."
-        meta_txt2 = font_tiny.render(f"       {meta_p2}", True, YELLOW_COLOR)
-        screen.blit(meta_txt2, (202, 188))
-    else:
-        status_info = "* 实时采样中 | Audio PCM Capture" if is_playing else "|| 传输暂停"
-        info_txt = font_tiny.render(status_info, True, MUTED_TEXT)
-        screen.blit(info_txt, (202, 188))
-
-    play_status_str = "LIVE" if is_playing else "PAUSE"
-    p_color = GREEN_COLOR if is_playing else MUTED_TEXT
-    pygame.draw.rect(screen, (20, 30, 42), (202, 212, 260, 20), border_radius=4)
-    screen.blit(font_tiny.render(play_status_str, True, p_color), (210, 215))
-
-    # F. 底部控制按钮
-    pygame.draw.rect(screen, BTN_COLOR, btn_prev, border_radius=8)
-    screen.blit(font_large.render("|<", True, TEXT_COLOR), (btn_prev.x + 30, btn_prev.y + 14))
-
-    play_bg = ACCENT_COLOR if is_playing else GREEN_COLOR
-    pygame.draw.rect(screen, play_bg, btn_play, border_radius=8)
-    play_symbol = "PAUSE" if is_playing else "PLAY"
-    offset_x = 22 if is_playing else 26
-    screen.blit(font_medium.render(play_symbol, True, BG_COLOR), (btn_play.x + offset_x, btn_play.y + 18))
-
-    pygame.draw.rect(screen, BTN_COLOR, btn_next, border_radius=8)
-    screen.blit(font_large.render(">|", True, TEXT_COLOR), (btn_next.x + 28, btn_next.y + 14))
-
-    pygame.display.flip()
-
-def handle_vol_drag(mouse_x):
-    ratio = (mouse_x - vol_x) / float(vol_w)
-    set_volume(ratio * 100)
-
-# --- 9. 主循环 ---
-play_station(current_index)
-clock = pygame.time.Clock()
-last_meta_check = 0
-
-try:
-    while True:
-        current_time_sec = time.time()
-
-        cpu_use, ram_use, cpu_temp = update_system_stats()
-
-        if current_time_sec - last_meta_check > 2.5:
-            last_meta_check = current_time_sec
-            fetch_metadata()
-
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                exit_app()
-
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    exit_app()
-                elif event.key == pygame.K_SPACE:
-                    toggle_play()
-
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                pos = event.pos
-
-                # 点击退出按钮
-                if btn_exit.collidepoint(pos):
-                    exit_app()
-
-                # 检测音量条拖拽/点击
-                if vol_rect.collidepoint(pos):
-                    is_dragging_vol = True
-                    handle_vol_drag(pos[0])
-
-                for i, rect in enumerate(station_rects):
-                    if rect.collidepoint(pos):
-                        if current_index != i:
-                            current_index = i
-                            play_station(current_index)
+    def pointer(self, kind, pos):
+        if self.night:
+            if kind == "down":
+                self.night = False
+                self.drag = self.press = None
+            return
+        if kind == "down":
+            self.press, self.moved = pos, False
+            if self.vol_rect.collidepoint(pos):
+                self.drag = "volume"
+                self.drag_volume(pos[0])
+            elif self.list_rect.collidepoint(pos):
+                self.drag, self.scroll_start = "list", self.offset
+            else:
+                self.drag = None
+        elif kind == "move" and self.press:
+            if self.drag == "volume":
+                self.drag_volume(pos[0])
+            elif self.drag == "list":
+                delta = pos[1] - self.press[1]
+                if abs(delta) > 8:
+                    self.moved = True
+                if self.moved:
+                    self.offset = self.scroll_start - delta
+                    self.clamp_scroll()
+        elif kind == "up" and self.press:
+            if self.drag == "list" and not self.moved and self.list_rect.collidepoint(pos):
+                row = int((pos[1] - self.list_rect.y + self.offset) // 38)
+                indices = self.visible_indices()
+                if 0 <= row < len(indices):
+                    self.select(indices[row])
+            elif self.drag is None:
+                for name, rect in self.buttons.items():
+                    if rect.collidepoint(self.press) and rect.collidepoint(pos):
+                        self.action(name)
                         break
+            self.drag = self.press = None
 
-                if btn_prev.collidepoint(pos):
-                    current_index = (current_index - 1) % len(STATIONS)
-                    play_station(current_index)
+    def handle_event(self, event):
+        pg = self.pg
+        if event.type == pg.QUIT:
+            self.running = False
+        elif event.type == pg.KEYDOWN:
+            actions = {pg.K_SPACE: "play", pg.K_LEFT: "prev", pg.K_RIGHT: "next",
+                       pg.K_n: "night", pg.K_i: "info", pg.K_s: "sleep", pg.K_f: "favorite"}
+            if event.key == pg.K_ESCAPE:
+                if self.night:
+                    self.night = False
+                else:
+                    self.running = False
+            elif event.key in (pg.K_UP, pg.K_EQUALS, pg.K_KP_PLUS):
+                self.volume(self.settings["volume"] + 5)
+            elif event.key in (pg.K_DOWN, pg.K_MINUS, pg.K_KP_MINUS):
+                self.volume(self.settings["volume"] - 5)
+            elif event.key in actions:
+                self.action(actions[event.key])
+        elif event.type == pg.MOUSEWHEEL and not self.night:
+            self.offset -= event.y * 38
+            self.clamp_scroll()
+        elif event.type in (pg.MOUSEBUTTONDOWN, pg.MOUSEBUTTONUP, pg.MOUSEMOTION):
+            if getattr(event, "touch", False):
+                return  # Finger events below handle touch, without duplicate clicks.
+            if event.type != pg.MOUSEMOTION and event.button != 1:
+                return
+            kind = {pg.MOUSEBUTTONDOWN: "down", pg.MOUSEBUTTONUP: "up", pg.MOUSEMOTION: "move"}[event.type]
+            self.pointer(kind, event.pos)
+        elif event.type in (pg.FINGERDOWN, pg.FINGERUP, pg.FINGERMOTION):
+            kind = {pg.FINGERDOWN: "down", pg.FINGERUP: "up", pg.FINGERMOTION: "move"}[event.type]
+            self.pointer(kind, (int(event.x * WIDTH), int(event.y * HEIGHT)))
+        elif event.type == pg.WINDOWFOCUSLOST:
+            self.drag = self.press = None
 
-                elif btn_play.collidepoint(pos):
-                    toggle_play()
+    def text(self, text, x, y, size=14, color=WHITE, width=None, scroll=False):
+        font = self.fonts[size]
+        text = str(text)
+        if width and not scroll and font.size(text)[0] > width:
+            while text and font.size(text + "…")[0] > width:
+                text = text[:-1]
+            text += "…"
+        surface = font.render(text, True, color)
+        old_clip = self.screen.get_clip()
+        if width:
+            self.screen.set_clip(old_clip.clip(self.pg.Rect(x, y, width, font.get_linesize())))
+        offset = 0
+        if scroll and width and surface.get_width() > width:
+            distance = surface.get_width() - width
+            elapsed = time.monotonic() % (distance / 24 + 4)
+            offset = min(distance, max(0, elapsed - 2) * 24)
+        self.screen.blit(surface, (x - int(offset), y))
+        self.screen.set_clip(old_clip)
 
-                elif btn_next.collidepoint(pos):
-                    current_index = (current_index + 1) % len(STATIONS)
-                    play_station(current_index)
+    def button(self, name, label, color=WHITE, fill=CARD):
+        rect = self.buttons[name]
+        self.pg.draw.rect(self.screen, fill, rect, border_radius=7)
+        font = self.fonts[14]
+        width, height = font.size(label)
+        self.text(label, rect.centerx - width // 2, rect.centery - height // 2, color=color)
 
-            elif event.type == pygame.MOUSEBUTTONUP:
-                is_dragging_vol = False
+    def draw_meter(self, capture):
+        pg = self.pg
+        active = self.snapshot.status == "playing"
+        for channel, (value, peak) in enumerate(((capture.left, capture.peak_left), (capture.right, capture.peak_right))):
+            y = 126 + channel * 19
+            self.text("LR"[channel], 184, y - 2, 11, MUTED)
+            for i in range(10):
+                color = GREEN if i < 6 else ACCENT if i < 8 else RED
+                rect = pg.Rect(201 + i * 25, y, 21, 10)
+                pg.draw.rect(self.screen, color if active and value >= i + 1 else (35, 45, 57), rect, border_radius=2)
+                if active and peak > 0 and i == min(9, int(math.ceil(peak)) - 1):
+                    pg.draw.line(self.screen, WHITE, rect.topleft, rect.topright)
+        for label, x in (("-60", 201), ("-36", 295), ("-18", 370), ("0", 438)):
+            self.text(label, x, 161, 11, MUTED)
+        self.text(capture.status, 184, 185, 12, CYAN if capture.updated else MUTED, 278)
 
-            elif event.type == pygame.MOUSEMOTION:
-                if is_dragging_vol:
-                    handle_vol_drag(event.pos[0])
+    def draw(self):
+        pg = self.pg
+        self.screen.fill(BG)
+        now = datetime.datetime.now()
+        snapshot, capture = self.snapshot, self.meter.snapshot()
+        if self.night:
+            self.text(now.strftime("%H:%M"), 144, 57, 62, (130, 145, 159))
+            self.text(now.strftime("%m-%d") + "  " + "周" + "一二三四五六日"[now.weekday()], 195, 136, 16, MUTED)
+            self.text(self.stations[self.index]["name"], 40, 178, 20, MUTED, 400)
+            self.text(snapshot.detail, 40, 213, 14, MUTED, 400)
+            remaining = f"剩余 {math.ceil(snapshot.sleep_remaining / 60)} 分钟 · " if snapshot.sleep_remaining else ""
+            self.text(remaining + "轻触屏幕返回", 40, 275, 14, MUTED, 400)
+            pg.display.flip()
+            return
+        indices = self.visible_indices()
+        self.button("filter", f"{'收藏' if self.only_favorites else '全部电台'} · {len(indices)}", CYAN)
+        self.text(now.strftime("%H:%M"), 177, 13, 20)
+        sleep_label = f"{math.ceil(snapshot.sleep_remaining / 60)} 分" if snapshot.sleep_remaining else "定时"
+        self.button("sleep", sleep_label, ACCENT if snapshot.sleep_remaining else MUTED)
+        self.button("night", "夜间", MUTED)
+        self.button("info", "返回" if self.info else "状态", MUTED)
+        self.button("exit", "退出", MUTED)
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(self.list_rect)
+        for row, index in enumerate(indices):
+            rect = pg.Rect(8, 45 + row * 38 - int(self.offset), 150, 34)
+            if not rect.colliderect(self.list_rect):
+                continue
+            selected = index == self.index
+            pg.draw.rect(self.screen, ACTIVE if selected else CARD, rect, border_radius=6)
+            if selected:
+                pg.draw.rect(self.screen, ACCENT, (8, rect.y + 7, 3, 20), border_radius=1)
+            label = ("* " if self.stations[index]["url"] in self.favorites else "") + self.stations[index]["name"]
+            self.text(label, 17, rect.y + 8, 14, ACCENT if selected else WHITE, 134)
+        if not indices:
+            self.text("还没有收藏", 23, 104, 16, MUTED)
+            self.text("点电台右侧 * 添加", 17, 136, 12, MUTED)
+        self.screen.set_clip(old_clip)
+        if len(indices) > 6:
+            total = len(indices) * 38
+            thumb = max(12, int(228 * 228 / total))
+            y = 45 + int((228 - thumb) * self.offset / (total - 228))
+            pg.draw.rect(self.screen, MUTED, (160, y, 2, thumb), border_radius=1)
+        self.button("up", "上页", MUTED)
+        self.button("down", "下页", MUTED)
+        pg.draw.rect(self.screen, CARD, (174, 45, 298, 212), border_radius=9)
+        self.text(self.stations[self.index]["name"], 184, 53, 20, ACCENT, 246, scroll=True)
+        self.button("favorite", "*", ACCENT if self.stations[self.index]["url"] in self.favorites else MUTED)
+        status_color = GREEN if snapshot.status == "playing" else RED if snapshot.status == "error" else MUTED
+        self.text(snapshot.detail, 184, 84, 12, status_color, 278)
+        if self.info:
+            temp = f"{self.stats.temp:.1f}°C" if self.stats.temp is not None else "不可用"
+            self.text(f"CPU {self.stats.cpu:.0f}%   内存 {self.stats.ram:.0f}%", 184, 111, 14)
+            self.text(f"温度 {temp}   下载 {self.stats.speed:.1f} KB/s", 184, 138, 12, MUTED, 278)
+            self.text("网速为整机接收流量", 184, 161, 11, MUTED)
+            self.text(capture.device or capture.status, 184, 185, 12, CYAN, 278, scroll=True)
+        else:
+            self.text(snapshot.metadata or "等待电台曲目信息…", 184, 106, 12, WHITE, 278, scroll=True)
+            self.draw_meter(capture)
+        self.text(f"音量 {self.settings['volume']}%", 184, 211, 12, CYAN)
+        pg.draw.rect(self.screen, BG, (188, 237, 270, 6), border_radius=3)
+        fill = round(self.settings["volume"] / 100 * 270)
+        if fill:
+            pg.draw.rect(self.screen, CYAN, (188, 237, fill, 6), border_radius=3)
+        pg.draw.circle(self.screen, WHITE, (188 + fill, 240), 7)
+        self.button("prev", "上一台")
+        wanted = snapshot.status in ("playing", "connecting", "buffering", "retrying")
+        self.button("play", "暂停" if wanted else "播放", BG, ACCENT if wanted else GREEN)
+        self.button("next", "下一台")
+        if time.monotonic() < self.toast_until:
+            pg.draw.rect(self.screen, ACTIVE, (174, 176, 298, 32), border_radius=6)
+            self.text(self.toast, 184, 183, 12, WHITE, 278)
+        pg.display.flip()
 
-        draw_ui(cpu_use, ram_use, cpu_temp)
-        clock.tick(30)  # 60 FPS 高帧率响应真实音轨
+    def run(self):
+        clock = self.pg.time.Clock()
+        while self.running:
+            self.snapshot = self.radio.snapshot()
+            if self.snapshot.status == "playing":
+                self.meter.active.set()
+            else:
+                self.meter.active.clear()
+            for event in self.pg.event.get():
+                self.handle_event(event)
+            self.stats.update(time.monotonic())
+            self.persist()
+            self.draw()
+            clock.tick(10 if self.night else 30)
 
-finally:
-    exit_app()
+
+def configure_logging():
+    handlers = [logging.StreamHandler()]
+    try:
+        handlers.append(RotatingFileHandler(BASE / "piradiobox.log", maxBytes=512_000,
+                                           backupCount=2, encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        handlers=handlers)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PiRadioBox 网络收音机")
+    parser.add_argument("--config", type=Path, default=BASE / "config.json")
+    parser.add_argument("--state", type=Path, default=BASE / "state.json")
+    parser.add_argument("--windowed", action="store_true", help="窗口模式")
+    parser.add_argument("--no-vu", action="store_true", help="禁用输出电平采集")
+    parser.add_argument("--check-config", action="store_true", help="仅验证配置")
+    parser.add_argument("--list-audio-devices", action="store_true", help="列出音频设备 ID")
+    args = parser.parse_args()
+    configure_logging()
+    try:
+        config = load_config(args.config)
+        if args.check_config:
+            print(f"配置有效，共 {len(config['stations'])} 个电台")
+            return 0
+        if args.list_audio_devices:
+            import soundcard as sc
+            print("默认输出:", sc.default_speaker())
+            for mic in sc.all_microphones(include_loopback=True):
+                print(f"{'MONITOR' if getattr(mic, 'isloopback', False) else 'INPUT'} | {mic.id} | {mic.name}")
+            return 0
+        if args.windowed:
+            config["fullscreen"] = False
+        if args.no_vu:
+            config["vu_enabled"] = False
+        settings = load_settings(args.state, config)
+        import pygame
+        from radio_audio import AudioMeter, RadioService
+        radio = meter = app = None
+        try:
+            pygame.display.init()
+            pygame.font.init()
+            # Check font availability before starting any audio.
+            find_font(pygame, config["font_path"])
+            radio = RadioService(config, settings)
+            meter = AudioMeter(config["vu_enabled"], config["monitor_device"])
+            app = RadioApp(pygame, config, settings, args.state, radio, meter)
+            app.run()
+        finally:
+            if app is not None:
+                app.persist(force=True)
+            if radio is not None:
+                radio.close()
+            if meter is not None:
+                meter.close()
+            pygame.quit()
+    except KeyboardInterrupt:
+        return 0
+    except Exception:
+        LOG.exception("启动或运行失败")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

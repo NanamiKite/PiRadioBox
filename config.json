@@ -1,0 +1,20 @@
+{
+  "autoplay": true,
+  "fullscreen": true,
+  "volume": 40,
+  "connect_timeout": 20,
+  "max_retries": 3,
+  "network_caching_ms": 1500,
+  "vu_enabled": true,
+  "monitor_device": "",
+  "font_path": "",
+  "stations": [
+    {"name": "Lofi Chill 音乐", "url": "https://stream.zeno.fm/f3wvbbqmdg8uv"},
+    {"name": "爵士放松电台", "url": "https://stream.zeno.fm/0r0xa792kwzuv"},
+    {"name": "Classic FM 古典", "url": "http://media-ice.musicradio.com/ClassicFMMP3"},
+    {"name": "80-90年代经典老歌", "url": "http://stream.zeno.fm/u2e6z6d52zzuv"},
+    {"name": "CNR 中国之声", "url": "http://ngcdn001.cnr.cn/live/zgzs/index.m3u8"},
+    {"name": "CNR 音乐之声", "url": "http://ngcdn003.cnr.cn/live/yyzs/index.m3u8"},
+    {"name": "CRI 轻松调频 EZFM", "url": "http://live.hitfm.cn/ezfm.m3u8"}
+  ]
+}
